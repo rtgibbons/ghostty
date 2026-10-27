@@ -6,6 +6,7 @@ const cli_args = @import("args.zig");
 const diagnostics = @import("diagnostics.zig");
 const Action = @import("ghostty.zig").Action;
 const DiskCache = @import("ssh_cache.zig").DiskCache;
+const internal_os = @import("../os/main.zig");
 const terminfopkg = @import("../terminfo/main.zig");
 const global = @import("../global.zig");
 
@@ -273,10 +274,11 @@ fn runInner(
     } = session: {
         if (!opts.terminfo) break :session .{ .term = "xterm-256color" };
 
-        const dest = resolveDestination(alloc, opts.ssh, opts._ssh_args.items) orelse {
+        const resolved = resolveSshConfig(alloc, opts.ssh, opts._ssh_args.items) orelse {
             warnPrint(stderr, "could not resolve ssh destination; skipping terminfo install", .{});
             break :session .{ .term = "xterm-256color" };
         };
+        const dest = resolved.destination;
 
         const cache: ?DiskCache = if (opts.cache) cache: {
             const path = DiskCache.defaultPath(alloc, "ghostty") catch |err| {
@@ -313,7 +315,7 @@ fn runInner(
         stderr.print("Setting up xterm-ghostty terminfo on {s}...\n", .{dest}) catch {};
         stderr.flush() catch {};
 
-        installRemoteTerminfo(alloc, opts, stderr) catch |err| {
+        installRemoteTerminfo(alloc, opts, stderr, resolved.control_path) catch |err| {
             warnPrint(stderr, "failed to install terminfo: {t}", .{err});
             break :session .{ .term = "xterm-256color" };
         };
@@ -457,14 +459,26 @@ fn checkExit(term: std.process.Child.Term, label: []const u8) error{ChildFailed}
     }
 }
 
-/// Run `ssh -G <args>` and parse the output for `user` and `hostname`.
-/// Returns the resolved `user@hostname`, or null if the destination
-/// could not be resolved.
-fn resolveDestination(
+const ResolvedSshConfig = struct {
+    destination: []const u8,
+    control_path: ?[]const u8,
+};
+
+/// Run `ssh -G <args>` once and parse the output for `user`, `hostname`,
+/// `port`, and the effective `controlpath`. This includes options supplied
+/// through `-S`, `-o`, and Host/Match blocks in SSH configuration files.
+///
+/// Returns the resolved destination cache key (`user@hostname`, with a
+/// non-default port when applicable; see parseDestination) and the optional
+/// control path. The path borrows from the output allocated in the caller's
+/// arena. Returns null if ssh fails or the destination cannot be resolved.
+/// A missing control path is not an error: it selects the installer's
+/// existing private-master fallback without another configuration query.
+fn resolveSshConfig(
     alloc: Allocator,
     ssh: []const u8,
     args: []const []const u8,
-) ?[]const u8 {
+) ?ResolvedSshConfig {
     const argv = std.mem.concat(alloc, []const u8, &.{
         &.{ ssh, "-G" },
         args,
@@ -478,7 +492,25 @@ fn resolveDestination(
         return null;
     };
     checkExit(result.term, "ssh -G") catch return null;
-    return parseDestination(alloc, result.stdout);
+    return .{
+        .destination = parseDestination(alloc, result.stdout) orelse return null,
+        .control_path = parseControlPath(result.stdout),
+    };
+}
+
+/// The returned path borrows from stdout, which lives in the caller's arena.
+/// OpenSSH omits ControlPath when unset or explicitly "none"; either case
+/// retains the installer's existing private-master fallback.
+fn parseControlPath(stdout: []const u8) ?[]const u8 {
+    var it = std.mem.tokenizeScalar(u8, stdout, '\n');
+    while (it.next()) |line| {
+        const prefix = "controlpath ";
+        if (!std.mem.startsWith(u8, line, prefix)) continue;
+        const value = line[prefix.len..];
+        if (value.len == 0 or std.ascii.eqlIgnoreCase(value, "none")) return null;
+        return value;
+    }
+    return null;
 }
 
 /// Parse `ssh -G` output for `user`, `hostname` and `port` and return the
@@ -524,17 +556,40 @@ fn parseDestination(alloc: Allocator, stdout: []const u8) ?[]const u8 {
     return alloc.print("{s}@{s}:{s}", .{ user, host, port }) catch null;
 }
 
-/// Install Ghostty's terminfo on the remote host using the caller's SSH
-/// configuration, including any existing multiplexed connection.
+/// Install Ghostty's terminfo on the remote host using the caller's
+/// effective ControlPath when configured, or a short-lived private SSH
+/// ControlMaster connection otherwise.
+///
+/// For a caller-configured path, leave multiplexing options unchanged so
+/// ssh can reuse an existing master or fall back according to the caller's
+/// configuration. Do not replace the path or change the master's lifetime.
+/// For the private fallback, the master tears down with the installer
+/// client (`ControlPersist=no`) so no local control socket lingers. This
+/// retains the existing behavior rather than keeping a private master
+/// alive for the subsequent interactive SSH invocation.
 fn installRemoteTerminfo(
     alloc: Allocator,
     opts: *const Options,
     stderr: *std.Io.Writer,
+    control_path: ?[]const u8,
 ) !void {
     var buf: std.Io.Writer.Allocating = .init(alloc);
     defer buf.deinit();
     try terminfopkg.ghostty.encode(&buf.writer);
     const terminfo = buf.written();
+
+    const private_control_path_opt: ?[]const u8 = if (control_path == null) path: {
+        // ControlPath is in TMPDIR with a short, random basename. ssh uses
+        // ControlPath as the bind address for a Unix domain socket; macOS
+        // limits sockaddr_un.sun_path to ~104 bytes, so keeping the path
+        // short leaves margin.
+        //
+        // Only generate a private path when ssh -G reported no effective
+        // caller path. Do not replace a configured path merely because
+        // its socket is absent or stale; ssh owns that fallback decision.
+        const private_path = try internal_os.randomTmpPath(alloc, "ghostty-ssh-");
+        break :path try alloc.print("ControlPath={s}", .{private_path});
+    } else null;
 
     // Under --verbose, let remote stderr through (the `tic` step is
     // the most common failure source) and inherit ssh's stderr so it
@@ -554,6 +609,7 @@ fn installRemoteTerminfo(
         opts.ssh,
         opts._ssh_args.items,
         remote_script,
+        private_control_path_opt,
     );
     verbosePrint(opts, stderr, "exec: {f}", .{Joined{ .items = argv }});
 
@@ -580,16 +636,42 @@ fn installRemoteTerminfo(
     checkExit(term, "terminfo install") catch return error.InstallFailed;
 }
 
-/// Do not override the caller's multiplexing options. In particular,
-/// ControlMaster=yes would prevent reuse of an existing master, and a
-/// command-line ControlPath would override one from the user's SSH config.
-/// Let ssh handle socket validation and fallback according to that config.
+/// Build the installer invocation with the remote script after the caller's
+/// SSH arguments. A non-null private_control_path_opt is the complete
+/// `ControlPath=...` option generated for the no-configured-path fallback;
+/// null means the caller's effective control path must remain authoritative.
+///
+/// Preserve the original private-master options and their ordering only
+/// in the fallback branch. Otherwise inject none of the three control
+/// options: prepended `-o` values can shadow the caller's configuration,
+/// and ControlMaster=yes would prevent reuse of an existing master even
+/// if the caller's socket path were retained.
 fn terminfoSshArgs(
     alloc: Allocator,
     ssh: []const u8,
     args: []const []const u8,
     remote_script: []const u8,
+    private_control_path_opt: ?[]const u8,
 ) Allocator.Error![][]const u8 {
+    if (private_control_path_opt) |path_opt| {
+        // Set up an SSH ControlMaster scoped to this single install:
+        //   - ControlMaster=yes makes our client also act as the master.
+        //   - ControlPersist=no tears the master down when our client
+        //     exits; no control socket lingers on the local side.
+        //   - ControlPath selects the short, random TMPDIR socket rather
+        //     than a caller-owned path. These options retain their original
+        //     position before the caller's arguments in the fallback case.
+        return std.mem.concat(alloc, []const u8, &.{
+            &.{ssh},
+            &.{
+                "-o", "ControlMaster=yes",
+                "-o", "ControlPersist=no",
+                "-o", path_opt,
+            },
+            args,
+            &.{remote_script},
+        });
+    }
     return std.mem.concat(alloc, []const u8, &.{
         &.{ssh},
         args,
@@ -604,10 +686,9 @@ test "terminfoSshArgs: preserve caller multiplexing options" {
         &.{ "-o", "ControlMaster=no", "-o", "ControlPath=/tmp/existing-master", "user@host" },
         &.{ "-o", "ControlMaster=auto", "-o", "ControlPersist=60", "-S", "/tmp/master", "user@host" },
         &.{ "-o", "ControlMaster=yes", "-S", "/tmp/master", "user@host" },
-        &.{ "-o", "ControlMaster=no", "-o", "ControlPath=none", "user@host" },
     };
     for (cases) |args| {
-        const argv = try terminfoSshArgs(testing.allocator, "/usr/bin/ssh", args, "tic -x -");
+        const argv = try terminfoSshArgs(testing.allocator, "/usr/bin/ssh", args, "tic -x -", null);
         defer testing.allocator.free(argv);
 
         try testing.expectEqual(args.len + 2, argv.len);
@@ -619,24 +700,93 @@ test "terminfoSshArgs: preserve caller multiplexing options" {
     }
 }
 
-test "terminfoSshArgs: leave SSH config and defaults authoritative" {
+test "terminfoSshArgs: preserve control path inherited from SSH config" {
     const testing = std.testing;
     const cases = [_][]const []const u8{
         &.{"host-alias"},
         &.{ "-F", "/tmp/ssh-config", "host-alias" },
     };
     for (cases) |args| {
-        const argv = try terminfoSshArgs(testing.allocator, "ssh", args, "tic -x -");
+        const argv = try terminfoSshArgs(testing.allocator, "ssh", args, "tic -x -", null);
         defer testing.allocator.free(argv);
 
-        // No injected -o options may shadow Host/Match configuration or
-        // create a private master when the user hasn't requested one.
+        // No injected -o options may shadow the configured control path.
         try testing.expectEqual(args.len + 2, argv.len);
         try testing.expectEqualStrings("ssh", argv[0]);
         for (args, argv[1 .. argv.len - 1]) |expected, actual| {
             try testing.expectEqualStrings(expected, actual);
         }
         try testing.expectEqualStrings("tic -x -", argv[argv.len - 1]);
+    }
+}
+
+test "terminfoSshArgs: retain original fallback without effective control path" {
+    const testing = std.testing;
+    const cases = [_][]const []const u8{
+        &.{"user@host"},
+        &.{ "-F", "/tmp/ssh-config", "host-alias" },
+        &.{ "-o", "ControlMaster=no", "user@host" },
+        // OpenSSH omits ControlPath=none from ssh -G output. Preserve
+        // the original fallback for this case rather than reinterpreting it.
+        &.{ "-o", "ControlPath=none", "user@host" },
+    };
+    const prefix = [_][]const u8{
+        "/usr/bin/ssh",
+        "-o",
+        "ControlMaster=yes",
+        "-o",
+        "ControlPersist=no",
+        "-o",
+        "ControlPath=/tmp/ghostty-ssh-test",
+    };
+    for (cases) |args| {
+        const argv = try terminfoSshArgs(
+            testing.allocator,
+            "/usr/bin/ssh",
+            args,
+            "tic -x -",
+            "ControlPath=/tmp/ghostty-ssh-test",
+        );
+        defer testing.allocator.free(argv);
+
+        try testing.expectEqual(prefix.len + args.len + 1, argv.len);
+        for (prefix, argv[0..prefix.len]) |expected, actual| {
+            try testing.expectEqualStrings(expected, actual);
+        }
+        for (args, argv[prefix.len .. argv.len - 1]) |expected, actual| {
+            try testing.expectEqualStrings(expected, actual);
+        }
+        try testing.expectEqualStrings("tic -x -", argv[argv.len - 1]);
+    }
+}
+
+test "parseControlPath: effective path after destination fields" {
+    const stdout =
+        \\user alice
+        \\hostname example.com
+        \\port 22
+        \\controlmaster false
+        \\controlpath /Users/alice/SSH Sockets/master
+        \\controlpersist no
+        \\
+    ;
+    try std.testing.expectEqualStrings(
+        "/Users/alice/SSH Sockets/master",
+        parseControlPath(stdout).?,
+    );
+}
+
+test "parseControlPath: absent or disabled path uses original fallback" {
+    const testing = std.testing;
+    const cases = [_][]const u8{
+        "",
+        "user alice\nhostname example.com\ncontrolmaster false\n",
+        "controlpath \n",
+        "controlpath none\n",
+        "controlpath NONE\n",
+    };
+    for (cases) |stdout| {
+        try testing.expectEqual(@as(?[]const u8, null), parseControlPath(stdout));
     }
 }
 
