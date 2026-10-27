@@ -6,7 +6,6 @@ const cli_args = @import("args.zig");
 const diagnostics = @import("diagnostics.zig");
 const Action = @import("ghostty.zig").Action;
 const DiskCache = @import("ssh_cache.zig").DiskCache;
-const internal_os = @import("../os/main.zig");
 const terminfopkg = @import("../terminfo/main.zig");
 const global = @import("../global.zig");
 
@@ -525,9 +524,8 @@ fn parseDestination(alloc: Allocator, stdout: []const u8) ?[]const u8 {
     return alloc.print("{s}@{s}:{s}", .{ user, host, port }) catch null;
 }
 
-/// Install Ghostty's terminfo on the remote host over a short-lived SSH
-/// ControlMaster connection. The master tears down with the client
-/// (`ControlPersist=no`) so no socket lingers.
+/// Install Ghostty's terminfo on the remote host using the caller's SSH
+/// configuration, including any existing multiplexed connection.
 fn installRemoteTerminfo(
     alloc: Allocator,
     opts: *const Options,
@@ -537,16 +535,6 @@ fn installRemoteTerminfo(
     defer buf.deinit();
     try terminfopkg.ghostty.encode(&buf.writer);
     const terminfo = buf.written();
-
-    // ControlPath is in TMPDIR with a short, random basename. ssh uses
-    // ControlPath as the bind address for a Unix domain socket; macOS
-    // limits sockaddr_un.sun_path to ~104 bytes, so keeping the path
-    // short leaves margin.
-    const control_path = try internal_os.randomTmpPath(alloc, "ghostty-ssh-");
-    const control_path_opt = try alloc.print(
-        "ControlPath={s}",
-        .{control_path},
-    );
 
     // Under --verbose, let remote stderr through (the `tic` step is
     // the most common failure source) and inherit ssh's stderr so it
@@ -561,20 +549,12 @@ fn installRemoteTerminfo(
         \\exit 1
     ;
 
-    // Set up an SSH ControlMaster scoped to this single install:
-    //   - ControlMaster=yes makes our client also act as the master.
-    //   - ControlPersist=no tears the master down when our client
-    //     exits; no socket lingers on the remote side.
-    const argv = try std.mem.concat(alloc, []const u8, &.{
-        &.{opts.ssh},
-        &.{
-            "-o", "ControlMaster=yes",
-            "-o", "ControlPersist=no",
-            "-o", control_path_opt,
-        },
+    const argv = try terminfoSshArgs(
+        alloc,
+        opts.ssh,
         opts._ssh_args.items,
-        &.{remote_script},
-    });
+        remote_script,
+    );
     verbosePrint(opts, stderr, "exec: {f}", .{Joined{ .items = argv }});
 
     var child = std.process.spawn(global.io(), .{
@@ -598,6 +578,66 @@ fn installRemoteTerminfo(
         return error.InstallFailed;
     };
     checkExit(term, "terminfo install") catch return error.InstallFailed;
+}
+
+/// Do not override the caller's multiplexing options. In particular,
+/// ControlMaster=yes would prevent reuse of an existing master, and a
+/// command-line ControlPath would override one from the user's SSH config.
+/// Let ssh handle socket validation and fallback according to that config.
+fn terminfoSshArgs(
+    alloc: Allocator,
+    ssh: []const u8,
+    args: []const []const u8,
+    remote_script: []const u8,
+) Allocator.Error![][]const u8 {
+    return std.mem.concat(alloc, []const u8, &.{
+        &.{ssh},
+        args,
+        &.{remote_script},
+    });
+}
+
+test "terminfoSshArgs: preserve caller multiplexing options" {
+    const testing = std.testing;
+    const cases = [_][]const []const u8{
+        &.{ "-o", "ControlMaster=no", "-S", "/tmp/existing-master", "user@host" },
+        &.{ "-o", "ControlMaster=no", "-o", "ControlPath=/tmp/existing-master", "user@host" },
+        &.{ "-o", "ControlMaster=auto", "-o", "ControlPersist=60", "-S", "/tmp/master", "user@host" },
+        &.{ "-o", "ControlMaster=yes", "-S", "/tmp/master", "user@host" },
+        &.{ "-o", "ControlMaster=no", "-o", "ControlPath=none", "user@host" },
+    };
+    for (cases) |args| {
+        const argv = try terminfoSshArgs(testing.allocator, "/usr/bin/ssh", args, "tic -x -");
+        defer testing.allocator.free(argv);
+
+        try testing.expectEqual(args.len + 2, argv.len);
+        try testing.expectEqualStrings("/usr/bin/ssh", argv[0]);
+        for (args, argv[1 .. argv.len - 1]) |expected, actual| {
+            try testing.expectEqualStrings(expected, actual);
+        }
+        try testing.expectEqualStrings("tic -x -", argv[argv.len - 1]);
+    }
+}
+
+test "terminfoSshArgs: leave SSH config and defaults authoritative" {
+    const testing = std.testing;
+    const cases = [_][]const []const u8{
+        &.{"host-alias"},
+        &.{ "-F", "/tmp/ssh-config", "host-alias" },
+    };
+    for (cases) |args| {
+        const argv = try terminfoSshArgs(testing.allocator, "ssh", args, "tic -x -");
+        defer testing.allocator.free(argv);
+
+        // No injected -o options may shadow Host/Match configuration or
+        // create a private master when the user hasn't requested one.
+        try testing.expectEqual(args.len + 2, argv.len);
+        try testing.expectEqualStrings("ssh", argv[0]);
+        for (args, argv[1 .. argv.len - 1]) |expected, actual| {
+            try testing.expectEqualStrings(expected, actual);
+        }
+        try testing.expectEqualStrings("tic -x -", argv[argv.len - 1]);
+    }
 }
 
 /// Run `argv` with the terminal's stdin, stdout, and stderr, and wait for
